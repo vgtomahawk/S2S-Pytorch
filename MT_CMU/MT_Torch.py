@@ -38,13 +38,28 @@ class SeqToSeqAttn(nn.Module):
             self.tgtEmbeddings=self.srcEmbeddings
         else:
             self.tgtEmbeddings=nn.Embedding(self.cnfg.tgtVocabSize,self.cnfg.emb_size)
-        self.encoder=nn.LSTM(self.cnfg.emb_size,self.cnfg.hidden_size)
-        if self.cnfg.use_reverse:
-            self.revcoder=nn.LSTM(self.cnfg.emb_size,self.cnfg.hidden_size)
-        if self.cnfg.use_attention:
-            self.decoder=nn.LSTM(self.cnfg.emb_size+self.cnfg.hidden_size,self.cnfg.hidden_size)
+        if self.cnfg.use_LSTM:
+            self.encoder=nn.LSTM(self.cnfg.emb_size,self.cnfg.hidden_size)
         else:
-            self.decoder=nn.LSTM(self.cnfg.emb_size,self.cnfg.hidden_size)
+            self.encoder=nn.GRU(self.cnfg.emb_size,self.cnfg.hidden_size)
+
+        if self.cnfg.use_reverse:
+            if self.cnfg.use_LSTM:
+                self.revcoder=nn.LSTM(self.cnfg.emb_size,self.cnfg.hidden_size)
+            else:
+                self.revcoder=nn.GRU(self.cnfg.emb_size,self.cnfg.hidden_size)
+
+        if self.cnfg.use_attention:
+            if self.cnfg.use_LSTM:
+                self.decoder=nn.LSTM(self.cnfg.emb_size+self.cnfg.hidden_size,self.cnfg.hidden_size)
+            else:
+                self.decoder=nn.GRU(self.cnfg.emb_size+self.cnfg.hidden_size,self.cnfg.hidden_size)
+        else:
+            if self.cnfg.use_LSTM:
+                self.decoder=nn.LSTM(self.cnfg.emb_size,self.cnfg.hidden_size)
+            else:
+                self.decoder=nn.GRU(self.cnfg.emb_size,self.cnfg.hidden_size)
+
         if self.cnfg.use_attention and self.cnfg.use_downstream:
             self.W=nn.Linear(2*self.cnfg.hidden_size,self.cnfg.tgtVocabSize)
         else:
@@ -57,12 +72,18 @@ class SeqToSeqAttn(nn.Module):
             tensor=tensor.cuda()
         return autograd.Variable(tensor,volatile=inference)
 
-    def init_hidden(self,batch):
+    def init_hidden(self,batch,LSTM=True):
         hiddenElem1=torch.zeros(1,batch.shape[1],self.cnfg.hidden_size)
-        hiddenElem2=torch.zeros(1,batch.shape[1],self.cnfg.hidden_size)
+        if self.cnfg.use_LSTM:
+            hiddenElem2=torch.zeros(1,batch.shape[1],self.cnfg.hidden_size)
         if torch.cuda.is_available():
-            hiddenElem1,hiddenElem2=hiddenElem1.cuda(),hiddenElem2.cuda()
-        return (autograd.Variable(hiddenElem1),autograd.Variable(hiddenElem2))
+            hiddenElem1=hiddenElem1.cuda()
+            if self.cnfg.use_LSTM:
+                hiddenElem2=hiddenElem2.cuda()
+        if self.cnfg.use_LSTM: 
+            return (autograd.Variable(hiddenElem1),autograd.Variable(hiddenElem2))
+        else:
+            return autograd.Variable(hiddenElem1)
 
     def save_checkpoint(self,modelName,optimizer):
         checkpoint={'state_dict':self.state_dict(),'optimizer':optimizer.state_dict()}
@@ -177,7 +198,10 @@ class SeqToSeqAttn(nn.Module):
                 else:
                     self.hidden=self.rev_hidden
             else:
-                self.hidden=(torch.add(self.enc_hidden[0],self.rev_hidden[0]),torch.add(self.enc_hidden[1],self.rev_hidden[1]))
+                if self.cnfg.use_LSTM:
+                    self.hidden=(torch.add(self.enc_hidden[0],self.rev_hidden[0]),torch.add(self.enc_hidden[1],self.rev_hidden[1]))
+                else:
+                    self.hidden=torch.add(self.enc_hidden,self.rev_hidden)
                 #self.hidden=(torch.mul(torch.add(self.enc_hidden[0],self.rev_hidden[0]),0.5),torch.mul(torch.add(self.enc_hidden[1],self.rev_hidden[1]),0.5))
         
         tgts=[] 
@@ -198,13 +222,21 @@ class SeqToSeqAttn(nn.Module):
         tgts.append(argmaxValue)
 
         if self.cnfg.mem_optimize:
-            del c_0
+            if not (self.cnfg.decoder_prev_random or self.cnfg.mixed_decoding):
+                del c_0
             del self.enc_hidden
             if self.cnfg.use_reverse:
                 del self.rev_hidden
  
         while argmaxValue!=self.cnfg.stop and len(tgts)<2*srcSentenceLength+10: #self.cnfg.TGT_LEN_LIMIT:
-            if self.cnfg.use_attention:
+            if self.cnfg.use_attention and self.cnfg.decoder_prev_random:
+                p=random.random()
+                if p<self.cnfg.p:
+                    choice=1
+                else:
+                    choice=0
+
+            if self.cnfg.use_attention and ( (not self.cnfg.decoder_prev_random) or (choice==0) or self.cnfg.mixed_decoding ) :
                 o_t=out
                 alphas=F.softmax(torch.cat([torch.sum(encoderOut*o_t,1) for encoderOut in encoderOuts],1))
                 encOutTensor=torch.cat([encoderOut.view(1,1,self.cnfg.hidden_size) for encoderOut in encoderOuts],1)
@@ -213,12 +245,19 @@ class SeqToSeqAttn(nn.Module):
             if self.cnfg.mem_optimize:
                 #Free useless references before large dot product
                 if self.cnfg.use_attention:
-                    del alphas
-                    del o_t
+                    if (not self.cnfg.decoder_prev_random) or (choice==0) or self.cnfg.mixed_decoding :
+                        del alphas
+                        del o_t
 
             if self.cnfg.use_attention:
-                c_t=torch.squeeze(torch.sum(alphaTensor*encOutTensor,1)).view(1,-1)
-
+                if (not self.cnfg.decoder_prev_random) or (choice==0):
+                    c_t=torch.squeeze(torch.sum(alphaTensor*encOutTensor,1)).view(1,-1)
+                if self.cnfg.decoder_prev_random and choice==1:
+                    c_t=c_0
+                elif self.cnfg.mixed_decoding:
+                    c_t=torch.mul(c_0,self.cnfg.p)+torch.mul(c_t,1-self.cnfg.p)
+                if self.cnfg.decoder_prev_random or self.cnfg.mixed_decoding:
+                    c_0=c_t
              
             row=np.array([argmaxValue,]*1)
             tgtEmbeds=self.tgtEmbeddings(self.getIndex(row,inference=True))
@@ -314,6 +353,7 @@ class SeqToSeqAttn(nn.Module):
 
 
         self.hidden=self.enc_hidden
+        
         if self.cnfg.use_reverse:
             if self.cnfg.init_mixed==False:
                 if self.cnfg.init_enc:
@@ -322,8 +362,10 @@ class SeqToSeqAttn(nn.Module):
                     self.hidden=self.rev_hidden
             else:
                 #self.hidden=(torch.mul(torch.add(self.enc_hidden[0],self.rev_hidden[0]),0.5),torch.mul(torch.add(self.enc_hidden[1],self.rev_hidden[1]),0.5))
-                self.hidden=(torch.add(self.enc_hidden[0],self.rev_hidden[0]),torch.add(self.enc_hidden[1],self.rev_hidden[1]))
-
+                if self.cnfg.use_LSTM:
+                    self.hidden=(torch.add(self.enc_hidden[0],self.rev_hidden[0]),torch.add(self.enc_hidden[1],self.rev_hidden[1]))
+                else:
+                    self.hidden=torch.add(self.enc_hidden,self.rev_hidden)
         
         #Init with START token
         if self.cnfg.use_attention:
@@ -335,7 +377,8 @@ class SeqToSeqAttn(nn.Module):
             tgtEmbeds=torch.cat([tgtEmbeds,c_0],1)
         out,self.hidden=self.decoder(tgtEmbeds.view(1,batch.shape[1],-1),self.hidden)
         if self.cnfg.mem_optimize:
-            del c_0
+            if not self.cnfg.context_dropout:
+                del c_0
             del self.enc_hidden
             if self.cnfg.use_reverse:
                 del self.rev_hidden
@@ -346,19 +389,32 @@ class SeqToSeqAttn(nn.Module):
         for rowId,row in enumerate(batch):
             
             if self.cnfg.use_attention:
-                o_t=decoderOuts[-1]
-                alphas=F.softmax(torch.cat([torch.sum(encoderOut*o_t,1) for encoderOut in encoderOuts],1))
-                encOutTensor=torch.cat([encoderOut.view(batch.shape[1],1,self.cnfg.hidden_size) for encoderOut in encoderOuts],1)
-                alphaTensor=(torch.unsqueeze(alphas,2)).expand(encOutTensor.size())
+                if self.cnfg.context_dropout:
+                    p=random.random()
+                    if p<self.cnfg.p:
+                        choice=1
+                    else:
+                        choice=0
+                if (not self.cnfg.context_dropout) or (choice==0):  
+                    o_t=decoderOuts[-1]
+                    alphas=F.softmax(torch.cat([torch.sum(encoderOut*o_t,1) for encoderOut in encoderOuts],1))
+                    encOutTensor=torch.cat([encoderOut.view(batch.shape[1],1,self.cnfg.hidden_size) for encoderOut in encoderOuts],1)
+                    alphaTensor=(torch.unsqueeze(alphas,2)).expand(encOutTensor.size())
             
             if self.cnfg.mem_optimize:
                 #Free useless references before large dot product
                 if self.cnfg.use_attention:
-                    del alphas
-                    del o_t
+                    if (not self.cnfg.context_dropout) or (choice==0):
+                        del alphas
+                        del o_t
 
             if self.cnfg.use_attention:
-                c_t=torch.squeeze(torch.sum(alphaTensor*encOutTensor,1))
+                if (not self.cnfg.context_dropout) or (choice==0):
+                    c_t=torch.squeeze(torch.sum(alphaTensor*encOutTensor,1))
+                else:
+                    c_t=c_0
+                if self.cnfg.context_dropout:
+                    c_0=c_t
                 contextVectors.append(c_t) 
 
             tgtEmbeds=self.tgtEmbeddings(self.getIndex(row,inference=inference))
@@ -372,7 +428,10 @@ class SeqToSeqAttn(nn.Module):
             decoderOuts.append(out.squeeze())
             if self.cnfg.mem_optimize:
                 if self.cnfg.use_attention:
-                    del alphaTensor,encOutTensor,c_t,tgtEmbeds
+                    if (not self.cnfg.context_dropout) or choice==0:
+                        del alphaTensor,encOutTensor,c_t,tgtEmbeds
+                    else:
+                        del c_t,tgtEmbeds
                 else:
                     del tgtEmbeds
 
@@ -562,8 +621,8 @@ def main():
         model.load_from_checkpoint(modelName)
         #print " ".join([model.reverse_wids_src[x] for x in test_src_batches[1][0]])
         #print " ".join([model.reverse_wids_tgt[x] for x in test_tgt_batches[1][0]])
-        #model(test_src_batches[1],test_tgt_batches[1],test_tgt_masks[1])      
-      
+        #model(test_src_batches[1],test_tgt_batches[1],test_tgt_masks[1])
         model.decodeAll(test_src_batches,modelName,method="greedy",evalMethod="BLEU",suffix="test")
+
 
 main()

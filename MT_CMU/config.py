@@ -10,12 +10,13 @@ use_reverse=True #Use bidirectional encoder (or not)
 init_mixed=True  #Initialize decoder state with avg of forward and backward encoder. If False, either only the forward or backward state is used for init
 init_enc=False #Use the forward encoder state for initializing decoder. If false the backward encoder (a.k.a revcoder) is used.
 use_attention=True #Turn attention on or off.
+use_LSTM=True #If True, uses LSTM else uses GRU
 
 optimizer_type="ADAM" # other option:"SGD"
 share_embeddings=False #Share encoder and decoder embeddings
 use_downstream=True #Whether to use context vector in final vocab softmax on decoder side.
 mode="train" #train,trial,inference Note: in train mode, supply only modelName, in inference mode, supply exact checkpoint path.
-problem="SUM" #Abstractive SUM/ De-to-En-MT Note: Summarization data not available on repo.
+problem="MT" #Abstractive SUM/ De-to-En-MT Note: Summarization data not available on repo.
 srcMasking=True #Whether src side masking is on (True recommended)
 
 if problem=="MT":
@@ -26,7 +27,10 @@ if problem=="MT":
     model_dir="MT_checkpoints/" #Directory to save
     #TGT_LEN_LIMIT=1000
     normalizeLoss=False #Whether to normalize loss per minibatch (recommended False)
-    decoder_prev_random=True #Not used yet.
+    decoder_prev_random=False #Randomly use previous context vector with prob.p at decoding time.
+    context_dropout=False
+    mixed_decoding=False
+    p=0.3
     PRINT_STEP=500 #Print every x minibatches
     batch_size=32 #Batch size
 
@@ -42,4 +46,4 @@ elif problem=="SUM":
     batch_size=64
 
 mem_optimize=True #Memory optimizations (deleting local variables in advance etc)
-cudnnBenchmark=True #CuDNN benchmark (purpoted speedup)
+cudnnBenchmark=True #CuDNN benchmark (purported speedup)
